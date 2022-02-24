@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import argparse
 import logging
 import os
@@ -25,6 +26,7 @@ Modified version of Fridump (https://github.com/Nightbringer21/fridump)
 
 # Modify to adjust focus level
 LOGGING_LEVEL = logging.INFO
+logging.basicConfig(format="[%(asctime)s][%(levelname)s] %(message)s")
 logger = logging.getLogger("fridump")
 logger.setLevel(LOGGING_LEVEL)
 
@@ -45,15 +47,32 @@ rpc.exports = {
 MAX_SIZE = 100000000
 
 
-async def dump_to_file(mem: bytes, outpath: str) -> None:
-    # Write the dumped page to disk
+async def dump_to_file(agent, base: int, size: int, outpath: str) -> None:
+    """
+    A helper to read a block of memory and write it to disk. We require
+    this abstraction to have a single point of Exception handling for things
+    like access violations.
+
+    Args:
+        agent: : the session used to communicate with Frida
+        base: int: the base address to start reading memory
+        size: int: how much memory to read
+        outpath: str: where to write the memory to disk
+
+    Returns
+        None
+    """
+    mem = None
     try:
-        # with open(os.path.join(directory, f"{base}_dump.data"), "wb") as fout:
-        with open(outpath, "wb") as fout:
-            fout.write()
+        mem = agent.read_memory(base, size)
     except Exception as e:
-        # Likely hit a memory access violation, consider supressing this.
-        logging.warning("[!]" + str(e))
+        # If read fails, it's likely due to an access violation
+        logging.debug(f"[!] {e}")
+        return
+
+    # Write the dumped page to disk
+    with open(outpath, "wb") as fout:
+        fout.write(mem)
 
 
 async def main(process: str, outpath: str = "dump"):
@@ -74,52 +93,65 @@ async def main(process: str, outpath: str = "dump"):
     # Connect to session with frida
     session = None
     try:
-        if USB:
-            session = frida.get_usb_device().attach(process)
-        else:
-            session = frida.attach(process)
+        session = frida.get_usb_device().attach(process)
     except Exception as e:
-        logger.error("Failed to attach to process, is frida-server running on device?")
-        logger.error(e)
-        sys.exit(1)
+        logger.error(f"Failed to start Frida session with {e}")
+        # Let's add logic here that will try to start Frida server
+        # if it's not already running. I'm going to setup EoS to
+        # provision the binary to /data/local/eos/frida-server
+        # start_frida_server()
+        return
 
     script = session.create_script(FRIDA_SCRIPT)
-    script.on("message", utils.on_message)
     script.load()
     agent = script.exports
 
     # What memory pages to scan, for a "wider" scan of memory set
     # this to be 'r--' for any "readable" memory page
-    ranges = agent.enumerate_ranges("rw-")
+    regions = agent.enumerate_ranges("rw-")
+
+    logger.info(f"Starting dump of {process}")
 
     # Performing the memory dump, consider bringing in tqdm for progress bar.
-    for range in ranges:
-        base = range["base"]
-        size = range["size"]
+    for region in regions:
+        # Note: we might be able to do some filtering here based off of the
+        # `file` value of the region, as it's included sometimes:
+        # {'base': '0xec521000', 'size': 4096, 'protection': 'rw-', 'file': {'path': '/system/lib/liblz4.so', 'offset': 57344, 'size': 0}}
+        # Perhaps this could facilitate some filtering.
+
+        base = int(region["base"], 16)
+        size = int(region["size"])
 
         if size > MAX_SIZE:
             logging.info("Too big, splitting the dump into chunks")
 
-            num_chunks = int(size / max_size)
+            num_chunks = int(size / MAX_SIZE)
             for i in range(num_chunks):
-                cur_base = base + (i * max_size)
-                mem = agent.read_memory(cur_base, max_size)
+                cur_base = base + (i * MAX_SIZE)
                 await dump_to_file(
-                    mem, os.path.join(outpath, f"{cur_base}_dumped.data")
+                    agent,
+                    cur_base,
+                    MAX_SIZE,
+                    os.path.join(outpath, f"{cur_base}_dumped.data"),
                 )
 
-            # If needed, read the final chunk if the page isn't perfectly
-            # divisible by our `max_size` value
-            if (diff := size % max_size) != 0:
-                tmp_base = base + (int(size / max_size) * max_size)
-                mem = agent.read_memory(tmp_base, diff)
+            # If needed, read the final chunk if the region isn't
+            # perfectly divisible by our `max_size` value
+            if (diff := size % MAX_SIZE) != 0:
+                tmp_base = base + (int(size / MAX_SIZE) * MAX_SIZE)
                 await dump_to_file(
-                    mem, os.path.join(outpath, f"{tmp_base}_dumped.data")
+                    agent,
+                    tmp_base,
+                    diff,
+                    os.path.join(outpath, f"{tmp_base}_dumped.data"),
                 )
 
         else:
-            mem = agent.read_memory(base, size)
-            await dump_to_file(mem, os.path.join(outpath, f"{base}_dumped.data"))
+            await dump_to_file(
+                agent, base, size, os.path.join(outpath, f"{base}_dumped.data")
+            )
+
+    logger.info(f"Done. Wrote {len(regions)} artifacts to {outpath}")
 
 
 if __name__ == "__main__":
