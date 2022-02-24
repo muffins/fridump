@@ -1,160 +1,140 @@
-import textwrap
-import frida
-import os
-import sys
-import frida.core
-import dumper
-import utils
+#!/usr/bin/env python3
+
 import argparse
 import logging
+import os
+import sys
+
+import frida
+import frida.core
+
 
 logo = """
-        ______    _     _
-        |  ___|  (_)   | |
-        | |_ _ __ _  __| |_   _ _ __ ___  _ __
-        |  _| '__| |/ _` | | | | '_ ` _ \| '_ \\
-        | | | |  | | (_| | |_| | | | | | | |_) |
-        \_| |_|  |_|\__,_|\__,_|_| |_| |_| .__/
-                                         | |
-                                         |_|
-        """
+______    _     _
+|  ___|  (_)   | |
+| |_ _ __ _  __| |_   _ _ __ ___  _ __
+|  _| '__| |/ _` | | | | '_ ` _ \| '_ \\
+| | | |  | | (_| | |_| | | | | | | |_) |
+\_| |_|  |_|\__,_|\__,_|_| |_| |_| .__/
+                                 | |
+                                 |_|
+
+Modified version of Fridump (https://github.com/Nightbringer21/fridump)
+"""
 
 
-# Main Menu
-def MENU():
-    parser = argparse.ArgumentParser(
-        prog='fridump',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent(""))
+# Modify to adjust focus level
+LOGGING_LEVEL = logging.INFO
+logger = logging.getLogger("fridump")
+logger.setLevel(LOGGING_LEVEL)
 
-    parser.add_argument('process',
-                        help='the process that you will be injecting to')
-    parser.add_argument('-o', '--out', type=str, metavar="dir",
-                        help='provide full output directory path. (def: \'dump\')')
-    parser.add_argument('-U', '--usb', action='store_true',
-                        help='device connected over usb')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='verbose')
-    parser.add_argument('-r', '--read-only', action='store_true',
-                        help="dump read-only parts of memory. More data, more errors")
-    parser.add_argument('-s', '--strings', action='store_true',
-                        help='run strings on all dump files. Saved in output dir.')
-    parser.add_argument('--max-size', type=int, metavar="bytes",
-                        help='maximum size of dump file in bytes (def: 20971520)')
-    args = parser.parse_args()
-    return args
+FRIDA_SCRIPT = """
+'use strict';
+
+rpc.exports = {
+  enumerateRanges: function (prot) {
+    return Process.enumerateRangesSync(prot);
+  },
+  readMemory: function (address, size) {
+    return Memory.readByteArray(ptr(address), size);
+  }
+};
+"""
+# Maximum size of each dump file in bytes, 20MB by default.
+# MAX_SIZE = 20971520
+MAX_SIZE = 100000000
 
 
-print(logo)
-
-arguments = MENU()
-
-# Define Configurations
-APP_NAME = arguments.process
-DIRECTORY = ""
-USB = arguments.usb
-DEBUG_LEVEL = logging.INFO
-STRINGS = arguments.strings
-MAX_SIZE = 20971520
-PERMS = 'rw-'
-
-if arguments.read_only:
-    PERMS = 'r--'
-
-if arguments.verbose:
-    DEBUG_LEVEL = logging.DEBUG
-logging.basicConfig(format='%(levelname)s:%(message)s', level=DEBUG_LEVEL)
+async def dump_to_file(mem: bytes, outpath: str) -> None:
+    # Write the dumped page to disk
+    try:
+        # with open(os.path.join(directory, f"{base}_dump.data"), "wb") as fout:
+        with open(outpath, "wb") as fout:
+            fout.write()
+    except Exception as e:
+        # Likely hit a memory access violation, consider supressing this.
+        logging.warning("[!]" + str(e))
 
 
-# Start a new Session
-session = None
-try:
-    if USB:
-        session = frida.get_usb_device().attach(APP_NAME)
-    else:
-        session = frida.attach(APP_NAME)
-except Exception as e:
-    print("Can't connect to App. Have you connected the device?")
-    logging.debug(str(e))
-    sys.exit()
+async def main(process: str, outpath: str = "dump"):
+    """
+    Main entry point for dumping the volatile memory of a running app.
 
+    Args:
+        process: str: The name of the process to dump
+        outpath: str: An optional path to where the artifacts should be dumped
 
-# Selecting Output directory
-if arguments.out is not None:
-    DIRECTORY = arguments.out
-    if os.path.isdir(DIRECTORY):
-        print("Output directory is set to: " + DIRECTORY)
-    else:
-        print("The selected output directory does not exist!")
+    Returns:
+        None
+    """
+
+    if not os.path.exists(outpath):
+        os.path.makedirs(outpath)
+
+    # Connect to session with frida
+    session = None
+    try:
+        if USB:
+            session = frida.get_usb_device().attach(process)
+        else:
+            session = frida.attach(process)
+    except Exception as e:
+        logger.error("Failed to attach to process, is frida-server running on device?")
+        logger.error(e)
         sys.exit(1)
 
-else:
-    print("Current Directory: " + str(os.getcwd()))
-    DIRECTORY = os.path.join(os.getcwd(), "dump")
-    print("Output directory is set to: " + DIRECTORY)
-    if not os.path.exists(DIRECTORY):
-        print("Creating directory...")
-        os.makedirs(DIRECTORY)
+    script = session.create_script(FRIDA_SCRIPT)
+    script.on("message", utils.on_message)
+    script.load()
+    agent = script.exports
 
-mem_access_viol = ""
+    # What memory pages to scan, for a "wider" scan of memory set
+    # this to be 'r--' for any "readable" memory page
+    ranges = agent.enumerate_ranges("rw-")
 
-print("Starting Memory dump...")
+    # Performing the memory dump, consider bringing in tqdm for progress bar.
+    for range in ranges:
+        base = range["base"]
+        size = range["size"]
 
-script = session.create_script(
-    """'use strict';
+        if size > MAX_SIZE:
+            logging.info("Too big, splitting the dump into chunks")
 
-    rpc.exports = {
-      enumerateRanges: function (prot) {
-        return Process.enumerateRangesSync(prot);
-      },
-      readMemory: function (address, size) {
-        return Memory.readByteArray(ptr(address), size);
-      }
-    };
+            num_chunks = int(size / max_size)
+            for i in range(num_chunks):
+                cur_base = base + (i * max_size)
+                mem = agent.read_memory(cur_base, max_size)
+                await dump_to_file(
+                    mem, os.path.join(outpath, f"{cur_base}_dumped.data")
+                )
 
-    """)
-script.on("message", utils.on_message)
-script.load()
+            # If needed, read the final chunk if the page isn't perfectly
+            # divisible by our `max_size` value
+            if (diff := size % max_size) != 0:
+                tmp_base = base + (int(size / max_size) * max_size)
+                mem = agent.read_memory(tmp_base, diff)
+                await dump_to_file(
+                    mem, os.path.join(outpath, f"{tmp_base}_dumped.data")
+                )
 
-agent = script.exports
-ranges = agent.enumerate_ranges(PERMS)
-
-if arguments.max_size is not None:
-    MAX_SIZE = arguments.max_size
-
-i = 0
-l = len(ranges)
-
-# Performing the memory dump
-for range in ranges:
-    base = range["base"]
-    size = range["size"]
-
-    logging.debug("Base Address: " + str(base))
-    logging.debug("")
-    logging.debug("Size: " + str(size))
+        else:
+            mem = agent.read_memory(base, size)
+            await dump_to_file(mem, os.path.join(outpath, f"{base}_dumped.data"))
 
 
-    if size > MAX_SIZE:
-        logging.debug("Too big, splitting the dump into chunks")
-        mem_access_viol = dumper.splitter(
-            agent, base, size, MAX_SIZE, mem_access_viol, DIRECTORY)
-        continue
-    mem_access_viol = dumper.dump_to_file(
-        agent, base, size, mem_access_viol, DIRECTORY)
-    i += 1
-    utils.printProgress(i, l, prefix='Progress:', suffix='Complete', bar=50)
-print("")
+if __name__ == "__main__":
 
-# Run Strings if selected
+    print(logo)
 
-if STRINGS:
-    files = os.listdir(DIRECTORY)
-    i = 0
-    l = len(files)
-    print("Running strings on all files:")
-    for f1 in files:
-        utils.strings(f1, DIRECTORY)
-        i += 1
-        utils.printProgress(i, l, prefix='Progress:', suffix='Complete', bar=50)
-print("Finished!")
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("process", help="The target process to dump volatile memory for")
+    ap.add_argument(
+        "-o",
+        "--output",
+        default="./dump",
+        help="The output directory. Defaults to './dump'",
+    )
+
+    args = ap.parse_args()
+    asyncio.run(main(args.process, args.output))
