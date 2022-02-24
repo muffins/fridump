@@ -26,7 +26,9 @@ Modified version of Fridump (https://github.com/Nightbringer21/fridump)
 
 # Modify to adjust focus level
 LOGGING_LEVEL = logging.INFO
-logging.basicConfig(format="[%(asctime)s][%(levelname)s] %(message)s")
+logging.basicConfig(
+    format="[%(asctime)s][%(levelname)s] %(message)s", datefmt="%y-%b-%d %H:%M:%S"
+)
 logger = logging.getLogger("fridump")
 logger.setLevel(LOGGING_LEVEL)
 
@@ -88,7 +90,7 @@ async def main(process: str, outpath: str = "dump"):
     """
 
     if not os.path.exists(outpath):
-        os.path.makedirs(outpath)
+        os.makedirs(outpath)
 
     # Connect to session with frida
     session = None
@@ -110,7 +112,7 @@ async def main(process: str, outpath: str = "dump"):
     # this to be 'r--' for any "readable" memory page
     regions = agent.enumerate_ranges("rw-")
 
-    logger.info(f"Starting dump of {process}")
+    logger.info(f"Starting dump of '{process}'")
 
     # Performing the memory dump, consider bringing in tqdm for progress bar.
     for region in regions:
